@@ -442,6 +442,10 @@ def api_remove_membre(pid, uid):
 def api_stats():
     return jsonify(get_stats(current_user.id))
 
+# Création automatique de la base au démarrage
+with app.app_context():
+    db.create_all()
+
 
 if __name__ == '__main__':
     with app.app_context():
