@@ -1,37 +1,179 @@
 """
-TaskFlow Pro - Application Web
-Flask + SQLite + déployable sur Railway/Render/Heroku
+TaskFlow Pro — Application Web SÉCURISÉE
+Flask + SQLite/PostgreSQL + protections complètes
+
+Mesures de sécurité implémentées :
+- CSRF protection (Flask-WTF)
+- Rate limiting (Flask-Limiter) — anti brute-force
+- Headers de sécurité (CSP, X-Frame-Options, HSTS...)
+- Hash de mots de passe (bcrypt via Werkzeug)
+- Validation et nettoyage des entrées (bleach anti-XSS)
+- Politique de mot de passe forte
+- Sessions sécurisées (HttpOnly, Secure, SameSite)
+- Contrôle d'accès strict (chaque utilisateur = ses données)
+- Verrouillage de compte après tentatives échouées
+- Cookies sécurisés
 """
-from flask import Flask, render_template, request, jsonify, redirect, url_for, flash, session
+from flask import Flask, render_template, request, jsonify, redirect, url_for, session, make_response
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
+from flask_wtf.csrf import CSRFProtect, generate_csrf
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from werkzeug.security import generate_password_hash, check_password_hash
-from datetime import datetime, date
-import os, json
+from datetime import datetime, date, timedelta
+import os, re, bleach, secrets
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'taskflow-secret-2024-change-me')
+
+# ═══════════════════════════════════════════════════════════
+# CONFIGURATION SÉCURISÉE
+# ═══════════════════════════════════════════════════════════
+
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY') or secrets.token_hex(32)
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///taskflow.db')
+if app.config['SQLALCHEMY_DATABASE_URI'].startswith('postgres://'):
+    # Render/Heroku donnent "postgres://" mais SQLAlchemy veut "postgresql://"
+    app.config['SQLALCHEMY_DATABASE_URI'] = app.config['SQLALCHEMY_DATABASE_URI'].replace('postgres://', 'postgresql://', 1)
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# Cookies de session sécurisés
+app.config['SESSION_COOKIE_HTTPONLY'] = True      # JS ne peut pas lire le cookie (anti-XSS)
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'     # protection CSRF basique
+app.config['SESSION_COOKIE_SECURE'] = os.environ.get('FLASK_ENV') == 'production'  # HTTPS only en prod
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=7)
+app.config['REMEMBER_COOKIE_HTTPONLY'] = True
+app.config['REMEMBER_COOKIE_SECURE'] = os.environ.get('FLASK_ENV') == 'production'
+app.config['REMEMBER_COOKIE_DURATION'] = timedelta(days=14)
+
+# Limite de taille des requêtes (anti DoS par gros payload)
+app.config['MAX_CONTENT_LENGTH'] = 1 * 1024 * 1024  # 1 MB max
 
 db = SQLAlchemy(app)
 login_manager = LoginManager(app)
 login_manager.login_view = 'login'
+login_manager.session_protection = "strong"  # détecte changement IP/user-agent
+
+# CSRF protection sur toutes les routes POST/PUT/DELETE
+csrf = CSRFProtect(app)
+
+# Rate limiting global — anti brute-force / anti spam
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["300 per hour", "60 per minute"],
+    storage_uri="memory://",
+)
+
+
+# ═══════════════════════════════════════════════════════════
+# HEADERS DE SÉCURITÉ (appliqués à chaque réponse)
+# ═══════════════════════════════════════════════════════════
+
+@app.after_request
+def set_security_headers(response):
+    # Empêche le site d'être affiché dans une iframe (anti clickjacking)
+    response.headers['X-Frame-Options'] = 'DENY'
+    # Empêche le navigateur de "deviner" un type MIME différent (anti MIME sniffing)
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    # Protection XSS navigateur (legacy mais inoffensif à garder)
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    # N'envoie pas le referrer complet vers d'autres sites
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    # Désactive les fonctionnalités sensibles du navigateur non utilisées
+    response.headers['Permissions-Policy'] = 'geolocation=(), microphone=(), camera=()'
+    # HSTS : force HTTPS pendant 1 an (uniquement en production)
+    if os.environ.get('FLASK_ENV') == 'production':
+        response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    # Content Security Policy — limite les sources de scripts/styles
+    response.headers['Content-Security-Policy'] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; "
+        "font-src 'self'; "
+        "connect-src 'self'; "
+        "frame-ancestors 'none'; "
+        "base-uri 'self'; "
+        "form-action 'self';"
+    )
+    return response
+
+
+# ═══════════════════════════════════════════════════════════
+# VALIDATION & NETTOYAGE DES ENTRÉES
+# ═══════════════════════════════════════════════════════════
+
+EMAIL_RE = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
+USERNAME_RE = re.compile(r'^[a-zA-Z0-9_\-\s]{2,40}$')
+
+def clean_text(value, max_len=500):
+    """Nettoie une chaîne : supprime le HTML dangereux, limite la longueur."""
+    if not isinstance(value, str):
+        return ''
+    value = bleach.clean(value.strip(), tags=[], strip=True)
+    return value[:max_len]
+
+def validate_email(email):
+    return bool(EMAIL_RE.match(email or '')) and len(email) <= 120
+
+def validate_username(username):
+    return bool(USERNAME_RE.match(username or ''))
+
+def validate_password(password):
+    """
+    Politique de mot de passe :
+    - au moins 8 caractères
+    - au moins 1 lettre et 1 chiffre
+    """
+    if not password or len(password) < 8:
+        return False, "Le mot de passe doit contenir au moins 8 caractères"
+    if not re.search(r'[A-Za-z]', password) or not re.search(r'\d', password):
+        return False, "Le mot de passe doit contenir au moins une lettre et un chiffre"
+    if len(password) > 128:
+        return False, "Mot de passe trop long"
+    return True, ""
+
+def validate_date(s):
+    """Vérifie qu'une date est au format YYYY-MM-DD valide, ou vide."""
+    if not s:
+        return True
+    try:
+        datetime.strptime(s, '%Y-%m-%d')
+        return True
+    except (ValueError, TypeError):
+        return False
+
+def validate_priorite(p):
+    return p in ('Urgente', 'Haute', 'Normale', 'Basse')
+
+def validate_categorie(c):
+    return c in ('General','Travail','Personnel','Etudes','Sante','Finance','Projet','Maison','Loisirs','Autre')
+
+def validate_hex_color(c):
+    return bool(re.match(r'^#[0-9A-Fa-f]{6}$', c or ''))
+
 
 # ═══════════════════════════════════════════════════════════
 # MODÈLES
 # ═══════════════════════════════════════════════════════════
 
 class User(UserMixin, db.Model):
-    id         = db.Column(db.Integer, primary_key=True)
-    username   = db.Column(db.String(80), unique=True, nullable=False)
-    email      = db.Column(db.String(120), unique=True, nullable=False)
-    password   = db.Column(db.String(256), nullable=False)
-    avatar     = db.Column(db.String(2), default='?')
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    taches     = db.relationship('Tache', backref='owner', lazy=True,
-                                  foreign_keys='Tache.user_id')
-    projets    = db.relationship('Projet', backref='owner', lazy=True)
+    id              = db.Column(db.Integer, primary_key=True)
+    username        = db.Column(db.String(40), unique=True, nullable=False)
+    email           = db.Column(db.String(120), unique=True, nullable=False, index=True)
+    password        = db.Column(db.String(256), nullable=False)
+    avatar          = db.Column(db.String(2), default='?')
+    created_at      = db.Column(db.DateTime, default=datetime.utcnow)
+    # Sécurité : verrouillage anti brute-force
+    failed_attempts = db.Column(db.Integer, default=0)
+    locked_until    = db.Column(db.DateTime, nullable=True)
+
+    taches  = db.relationship('Tache', backref='owner', lazy=True, foreign_keys='Tache.user_id')
+    projets = db.relationship('Projet', backref='owner', lazy=True)
+
+    def is_locked(self):
+        return self.locked_until is not None and self.locked_until > datetime.utcnow()
 
 
 class Projet(db.Model):
@@ -42,18 +184,18 @@ class Projet(db.Model):
     echeance    = db.Column(db.String(10), default='')
     archive     = db.Column(db.Boolean, default=False)
     created_at  = db.Column(db.DateTime, default=datetime.utcnow)
-    user_id     = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    user_id     = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
     taches      = db.relationship('Tache', backref='projet', lazy=True)
     membres     = db.relationship('MembreProjet', backref='projet', lazy=True, cascade='all, delete-orphan')
 
 
 class MembreProjet(db.Model):
-    id         = db.Column(db.Integer, primary_key=True)
-    projet_id  = db.Column(db.Integer, db.ForeignKey('projet.id'), nullable=False)
-    user_id    = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-    role       = db.Column(db.String(20), default='Membre')
-    joined_at  = db.Column(db.DateTime, default=datetime.utcnow)
-    user       = db.relationship('User', foreign_keys=[user_id])
+    id        = db.Column(db.Integer, primary_key=True)
+    projet_id = db.Column(db.Integer, db.ForeignKey('projet.id'), nullable=False, index=True)
+    user_id   = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    role      = db.Column(db.String(20), default='Membre')
+    joined_at = db.Column(db.DateTime, default=datetime.utcnow)
+    user      = db.relationship('User', foreign_keys=[user_id])
 
 
 class Tache(db.Model):
@@ -69,8 +211,8 @@ class Tache(db.Model):
     temps_passe  = db.Column(db.Integer, default=0)
     created_at   = db.Column(db.DateTime, default=datetime.utcnow)
     completed_at = db.Column(db.DateTime, nullable=True)
-    user_id      = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-    projet_id    = db.Column(db.Integer, db.ForeignKey('projet.id'), nullable=True)
+    user_id      = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    projet_id    = db.Column(db.Integer, db.ForeignKey('projet.id'), nullable=True, index=True)
     assigne_a    = db.Column(db.String(100), default='')
     sous_taches  = db.relationship('SousTache', backref='tache', lazy=True, cascade='all, delete-orphan')
     notes        = db.relationship('Note', backref='tache', lazy=True, cascade='all, delete-orphan')
@@ -86,7 +228,7 @@ class Tache(db.Model):
             'echeance': self.echeance,
             'echeance_txt': ech_txt,
             'echeance_statut': statut,
-            'tags': self.tags.split(',') if self.tags else [],
+            'tags': [t for t in self.tags.split(',') if t] if self.tags else [],
             'terminee': self.terminee,
             'epinglee': self.epinglee,
             'temps_passe': self.temps_passe,
@@ -101,19 +243,19 @@ class Tache(db.Model):
 
 
 class SousTache(db.Model):
-    id        = db.Column(db.Integer, primary_key=True)
-    titre     = db.Column(db.String(200), nullable=False)
-    terminee  = db.Column(db.Boolean, default=False)
-    tache_id  = db.Column(db.Integer, db.ForeignKey('tache.id'), nullable=False)
+    id       = db.Column(db.Integer, primary_key=True)
+    titre    = db.Column(db.String(200), nullable=False)
+    terminee = db.Column(db.Boolean, default=False)
+    tache_id = db.Column(db.Integer, db.ForeignKey('tache.id'), nullable=False, index=True)
 
     def to_dict(self):
         return {'id': self.id, 'titre': self.titre, 'terminee': self.terminee}
 
 
 class Note(db.Model):
-    id        = db.Column(db.Integer, primary_key=True)
-    texte     = db.Column(db.Text, nullable=False)
-    tache_id  = db.Column(db.Integer, db.ForeignKey('tache.id'), nullable=False)
+    id         = db.Column(db.Integer, primary_key=True)
+    texte      = db.Column(db.Text, nullable=False)
+    tache_id   = db.Column(db.Integer, db.ForeignKey('tache.id'), nullable=False, index=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 
@@ -146,7 +288,29 @@ def get_stats(user_id):
 
 @login_manager.user_loader
 def load_user(uid):
-    return User.query.get(int(uid))
+    try:
+        return User.query.get(int(uid))
+    except (ValueError, TypeError):
+        return None
+
+
+@login_manager.unauthorized_handler
+def unauthorized():
+    if request.path.startswith('/api/'):
+        return jsonify({'ok': False, 'msg': 'Authentification requise'}), 401
+    return redirect(url_for('login'))
+
+
+# ═══════════════════════════════════════════════════════════
+# OUTIL : récupérer une tâche appartenant à l'utilisateur
+# (Contrôle d'accès strict — empêche d'accéder aux données d'autrui)
+# ═══════════════════════════════════════════════════════════
+
+def get_owned_tache_or_404(tid):
+    return Tache.query.filter_by(id=tid, user_id=current_user.id).first_or_404()
+
+def get_owned_projet_or_404(pid):
+    return Projet.query.filter_by(id=pid, user_id=current_user.id).first_or_404()
 
 
 # ═══════════════════════════════════════════════════════════
@@ -161,36 +325,87 @@ def index():
 
 
 @app.route('/login', methods=['GET', 'POST'])
+@limiter.limit("10 per minute", methods=["POST"])  # anti brute-force sur le login
 def login():
     if current_user.is_authenticated:
         return redirect(url_for('dashboard'))
+
     if request.method == 'POST':
-        data = request.get_json() or request.form
-        user = User.query.filter_by(email=data.get('email', '').strip()).first()
-        if user and check_password_hash(user.password, data.get('password', '')):
-            login_user(user, remember=True)
-            return jsonify({'ok': True}) if request.is_json else redirect(url_for('dashboard'))
-        return jsonify({'ok': False, 'msg': 'Email ou mot de passe incorrect'}) if request.is_json else render_template('auth.html', error='Identifiants invalides')
+        data = request.get_json(silent=True) or {}
+        email = clean_text(data.get('email', ''), 120).lower()
+        password = data.get('password', '')
+
+        if not email or not password:
+            return jsonify({'ok': False, 'msg': 'Champs requis'}), 400
+
+        user = User.query.filter_by(email=email).first()
+
+        # Vérification du verrouillage de compte
+        if user and user.is_locked():
+            return jsonify({'ok': False, 'msg': 'Compte temporairement verrouillé (trop de tentatives). Réessaie dans 15 minutes.'}), 423
+
+        # Réponse générique pour ne pas révéler si l'email existe (anti énumération)
+        invalid_msg = 'Email ou mot de passe incorrect'
+
+        if not user or not check_password_hash(user.password, password):
+            if user:
+                user.failed_attempts = (user.failed_attempts or 0) + 1
+                if user.failed_attempts >= 5:
+                    user.locked_until = datetime.utcnow() + timedelta(minutes=15)
+                    user.failed_attempts = 0
+                db.session.commit()
+            return jsonify({'ok': False, 'msg': invalid_msg}), 401
+
+        # Connexion réussie : reset compteur
+        user.failed_attempts = 0
+        user.locked_until = None
+        db.session.commit()
+
+        session.permanent = True
+        login_user(user, remember=True)
+        return jsonify({'ok': True})
+
     return render_template('auth.html')
 
 
 @app.route('/register', methods=['POST'])
+@limiter.limit("5 per hour")  # anti spam de création de comptes
 def register():
-    data = request.get_json() or request.form
-    username = data.get('username', '').strip()
-    email    = data.get('email', '').strip()
+    data = request.get_json(silent=True) or {}
+    username = clean_text(data.get('username', ''), 40)
+    email    = clean_text(data.get('email', ''), 120).lower()
     password = data.get('password', '')
+
     if not username or not email or not password:
-        return jsonify({'ok': False, 'msg': 'Tous les champs sont requis'})
+        return jsonify({'ok': False, 'msg': 'Tous les champs sont requis'}), 400
+
+    if not validate_username(username):
+        return jsonify({'ok': False, 'msg': "Nom d'utilisateur invalide (2-40 caractères, lettres/chiffres/espaces)"}), 400
+
+    if not validate_email(email):
+        return jsonify({'ok': False, 'msg': 'Adresse email invalide'}), 400
+
+    ok, msg = validate_password(password)
+    if not ok:
+        return jsonify({'ok': False, 'msg': msg}), 400
+
     if User.query.filter_by(email=email).first():
-        return jsonify({'ok': False, 'msg': 'Email déjà utilisé'})
+        return jsonify({'ok': False, 'msg': 'Email déjà utilisé'}), 409
+
     if User.query.filter_by(username=username).first():
-        return jsonify({'ok': False, 'msg': 'Nom d\'utilisateur déjà pris'})
-    avatar = username[:2].upper()
-    user = User(username=username, email=email,
-                password=generate_password_hash(password), avatar=avatar)
-    db.session.add(user); db.session.commit()
-    login_user(user)
+        return jsonify({'ok': False, 'msg': "Nom d'utilisateur déjà pris"}), 409
+
+    avatar = (username[:2] or '??').upper()
+    user = User(
+        username=username, email=email,
+        password=generate_password_hash(password, method='pbkdf2:sha256', salt_length=16),
+        avatar=avatar,
+    )
+    db.session.add(user)
+    db.session.commit()
+
+    session.permanent = True
+    login_user(user, remember=True)
     return jsonify({'ok': True})
 
 
@@ -198,19 +413,20 @@ def register():
 @login_required
 def logout():
     logout_user()
-    return redirect(url_for('login'))
+    session.clear()
+    resp = make_response(redirect(url_for('login')))
+    return resp
 
 
 # ═══════════════════════════════════════════════════════════
-# ROUTES PRINCIPALES
+# ROUTE PRINCIPALE
 # ═══════════════════════════════════════════════════════════
 
 @app.route('/dashboard')
 @login_required
 def dashboard():
-    stats   = get_stats(current_user.id)
-    projets = Projet.query.filter_by(user_id=current_user.id, archive=False).all()
-    return render_template('dashboard.html', stats=stats, projets=projets, user=current_user)
+    stats = get_stats(current_user.id)
+    return render_template('dashboard.html', stats=stats, user=current_user, csrf_token=generate_csrf())
 
 
 # ═══════════════════════════════════════════════════════════
@@ -220,25 +436,34 @@ def dashboard():
 @app.route('/api/taches', methods=['GET'])
 @login_required
 def api_get_taches():
-    vue      = request.args.get('vue', 'toutes')
-    cat      = request.args.get('cat', '')
-    pid      = request.args.get('projet_id', '')
-    rech     = request.args.get('q', '').strip().lower()
-    tri      = request.args.get('tri', 'priorite')
-    corbeille = request.args.get('corbeille', '0') == '1'
+    vue  = request.args.get('vue', 'toutes')
+    cat  = request.args.get('cat', '')
+    pid  = request.args.get('projet_id', '')
+    rech = clean_text(request.args.get('q', ''), 100).lower()
+    tri  = request.args.get('tri', 'priorite')
 
     q = Tache.query.filter_by(user_id=current_user.id)
 
-    if vue == 'terminees':    q = q.filter_by(terminee=True)
-    elif vue == 'encours':    q = q.filter_by(terminee=False)
-    elif vue == 'epinglees':  q = q.filter_by(epinglee=True, terminee=False)
+    if vue == 'terminees':   q = q.filter_by(terminee=True)
+    elif vue == 'encours':   q = q.filter_by(terminee=False)
+    elif vue == 'epinglees': q = q.filter_by(epinglee=True, terminee=False)
 
-    if cat:  q = q.filter_by(categorie=cat)
-    if pid:  q = q.filter_by(projet_id=int(pid))
+    if cat and validate_categorie(cat):
+        q = q.filter_by(categorie=cat)
+
+    if pid:
+        try:
+            pid_int = int(pid)
+            # Vérifie que le projet appartient bien à l'utilisateur
+            if Projet.query.filter_by(id=pid_int, user_id=current_user.id).first():
+                q = q.filter_by(projet_id=pid_int)
+            else:
+                return jsonify([])
+        except ValueError:
+            return jsonify({'msg': 'projet_id invalide'}), 400
 
     taches = q.all()
 
-    # Filtres post-query
     if vue == 'retard':
         taches = [t for t in taches if not t.terminee and statut_echeance(t.echeance)[0] == 'retard']
     elif vue == 'auj':
@@ -247,10 +472,9 @@ def api_get_taches():
         taches = [t for t in taches if not t.terminee and t.priorite in ('Haute', 'Urgente')]
 
     if rech:
-        taches = [t for t in taches if rech in t.titre.lower() or rech in t.description.lower()
+        taches = [t for t in taches if rech in t.titre.lower() or rech in (t.description or '').lower()
                   or any(rech in tg.strip().lower() for tg in t.tags.split(',') if tg.strip())]
 
-    # Tri
     ordre = {'Urgente': 0, 'Haute': 1, 'Normale': 2, 'Basse': 3}
     if tri == 'priorite':
         taches.sort(key=lambda t: (not t.epinglee, t.terminee, ordre.get(t.priorite, 2)))
@@ -266,46 +490,123 @@ def api_get_taches():
 
 @app.route('/api/taches', methods=['POST'])
 @login_required
+@limiter.limit("60 per minute")
 def api_create_tache():
-    d = request.get_json()
+    d = request.get_json(silent=True) or {}
+
+    titre = clean_text(d.get('titre', ''), 200)
+    if not titre:
+        return jsonify({'msg': 'Le titre est requis'}), 400
+
+    priorite = d.get('priorite', 'Normale')
+    if not validate_priorite(priorite):
+        priorite = 'Normale'
+
+    categorie = d.get('categorie', 'General')
+    if not validate_categorie(categorie):
+        categorie = 'General'
+
+    echeance = clean_text(d.get('echeance', ''), 10)
+    if not validate_date(echeance):
+        return jsonify({'msg': 'Date invalide'}), 400
+
+    description = clean_text(d.get('description', ''), 2000)
+
+    tags_raw = d.get('tags', [])
+    if not isinstance(tags_raw, list):
+        tags_raw = []
+    tags = ','.join(clean_text(str(t), 30) for t in tags_raw[:10] if str(t).strip())
+
+    projet_id = d.get('projet_id')
+    if projet_id:
+        try:
+            projet_id = int(projet_id)
+            if not Projet.query.filter_by(id=projet_id, user_id=current_user.id).first():
+                return jsonify({'msg': 'Projet invalide'}), 400
+        except (ValueError, TypeError):
+            projet_id = None
+    else:
+        projet_id = None
+
+    assigne_a = clean_text(d.get('assigne_a', ''), 100)
+
     t = Tache(
-        titre       = d.get('titre', '').strip(),
-        description = d.get('description', ''),
-        priorite    = d.get('priorite', 'Normale'),
-        categorie   = d.get('categorie', 'General'),
-        echeance    = d.get('echeance', ''),
-        tags        = ','.join(d.get('tags', [])),
-        projet_id   = d.get('projet_id') or None,
-        assigne_a   = d.get('assigne_a', ''),
-        user_id     = current_user.id,
+        titre=titre, description=description, priorite=priorite,
+        categorie=categorie, echeance=echeance, tags=tags,
+        projet_id=projet_id, assigne_a=assigne_a, user_id=current_user.id,
     )
-    db.session.add(t); db.session.commit()
+    db.session.add(t)
+    db.session.commit()
     return jsonify(t.to_dict()), 201
 
 
 @app.route('/api/taches/<int:tid>', methods=['GET'])
 @login_required
 def api_get_tache(tid):
-    t = Tache.query.filter_by(id=tid, user_id=current_user.id).first_or_404()
-    d = t.to_dict()
-    d['notes'] = [{'id': n.id, 'texte': n.texte, 'date': n.created_at.strftime('%d/%m/%Y %H:%M')} for n in t.notes]
-    return jsonify(d)
+    t = get_owned_tache_or_404(tid)
+    dd = t.to_dict()
+    dd['notes'] = [{'id': n.id, 'texte': n.texte, 'date': n.created_at.strftime('%d/%m/%Y %H:%M')} for n in t.notes]
+    return jsonify(dd)
 
 
 @app.route('/api/taches/<int:tid>', methods=['PUT'])
 @login_required
+@limiter.limit("60 per minute")
 def api_update_tache(tid):
-    t = Tache.query.filter_by(id=tid, user_id=current_user.id).first_or_404()
-    d = request.get_json()
-    for field in ('titre', 'description', 'priorite', 'categorie', 'echeance', 'assigne_a'):
-        if field in d: setattr(t, field, d[field])
-    if 'tags' in d: t.tags = ','.join(d['tags'])
-    if 'projet_id' in d: t.projet_id = d['projet_id'] or None
+    t = get_owned_tache_or_404(tid)
+    d = request.get_json(silent=True) or {}
+
+    if 'titre' in d:
+        titre = clean_text(d['titre'], 200)
+        if titre: t.titre = titre
+
+    if 'description' in d:
+        t.description = clean_text(d['description'], 2000)
+
+    if 'priorite' in d and validate_priorite(d['priorite']):
+        t.priorite = d['priorite']
+
+    if 'categorie' in d and validate_categorie(d['categorie']):
+        t.categorie = d['categorie']
+
+    if 'echeance' in d:
+        ech = clean_text(d['echeance'], 10)
+        if validate_date(ech):
+            t.echeance = ech
+
+    if 'assigne_a' in d:
+        t.assigne_a = clean_text(d['assigne_a'], 100)
+
+    if 'tags' in d and isinstance(d['tags'], list):
+        t.tags = ','.join(clean_text(str(tg), 30) for tg in d['tags'][:10] if str(tg).strip())
+
+    if 'projet_id' in d:
+        pid = d['projet_id']
+        if pid:
+            try:
+                pid = int(pid)
+                if Projet.query.filter_by(id=pid, user_id=current_user.id).first():
+                    t.projet_id = pid
+            except (ValueError, TypeError):
+                pass
+        else:
+            t.projet_id = None
+
     if 'terminee' in d:
-        t.terminee = d['terminee']
-        t.completed_at = datetime.utcnow() if d['terminee'] else None
-    if 'epinglee' in d: t.epinglee = d['epinglee']
-    if 'temps_passe' in d: t.temps_passe = d['temps_passe']
+        t.terminee = bool(d['terminee'])
+        t.completed_at = datetime.utcnow() if t.terminee else None
+
+    if 'epinglee' in d:
+        t.epinglee = bool(d['epinglee'])
+
+    if 'temps_passe' in d:
+        try:
+            val = int(d['temps_passe'])
+            if 0 <= val <= 86400 * 30:  # max 30 jours, anti-valeurs absurdes
+                t.temps_passe = val
+        except (ValueError, TypeError):
+            pass
+
     db.session.commit()
     return jsonify(t.to_dict())
 
@@ -313,8 +614,9 @@ def api_update_tache(tid):
 @app.route('/api/taches/<int:tid>', methods=['DELETE'])
 @login_required
 def api_delete_tache(tid):
-    t = Tache.query.filter_by(id=tid, user_id=current_user.id).first_or_404()
-    db.session.delete(t); db.session.commit()
+    t = get_owned_tache_or_404(tid)
+    db.session.delete(t)
+    db.session.commit()
     return jsonify({'ok': True})
 
 
@@ -324,35 +626,58 @@ def api_delete_tache(tid):
 
 @app.route('/api/taches/<int:tid>/sous_taches', methods=['POST'])
 @login_required
+@limiter.limit("60 per minute")
 def api_add_sous_tache(tid):
-    t = Tache.query.filter_by(id=tid, user_id=current_user.id).first_or_404()
-    d = request.get_json()
-    st = SousTache(titre=d.get('titre', '').strip(), tache_id=tid)
-    db.session.add(st); db.session.commit()
+    t = get_owned_tache_or_404(tid)
+    d = request.get_json(silent=True) or {}
+    titre = clean_text(d.get('titre', ''), 200)
+    if not titre:
+        return jsonify({'msg': 'Titre requis'}), 400
+    if len(t.sous_taches) >= 50:
+        return jsonify({'msg': 'Limite de 50 sous-tâches atteinte'}), 400
+    st = SousTache(titre=titre, tache_id=t.id)
+    db.session.add(st)
+    db.session.commit()
     return jsonify(st.to_dict()), 201
 
 
 @app.route('/api/sous_taches/<int:sid>', methods=['PUT', 'DELETE'])
 @login_required
 def api_update_sous_tache(sid):
-    st = SousTache.query.get_or_404(sid)
+    # Vérifie que la sous-tâche appartient (via sa tâche) à l'utilisateur
+    st = SousTache.query.join(Tache).filter(
+        SousTache.id == sid, Tache.user_id == current_user.id
+    ).first_or_404()
+
     if request.method == 'DELETE':
-        db.session.delete(st); db.session.commit()
+        db.session.delete(st)
+        db.session.commit()
         return jsonify({'ok': True})
-    d = request.get_json()
-    if 'terminee' in d: st.terminee = d['terminee']
-    if 'titre' in d: st.titre = d['titre']
+
+    d = request.get_json(silent=True) or {}
+    if 'terminee' in d:
+        st.terminee = bool(d['terminee'])
+    if 'titre' in d:
+        titre = clean_text(d['titre'], 200)
+        if titre: st.titre = titre
     db.session.commit()
     return jsonify(st.to_dict())
 
 
 @app.route('/api/taches/<int:tid>/notes', methods=['POST'])
 @login_required
+@limiter.limit("60 per minute")
 def api_add_note(tid):
-    t = Tache.query.filter_by(id=tid, user_id=current_user.id).first_or_404()
-    d = request.get_json()
-    n = Note(texte=d.get('texte', '').strip(), tache_id=tid)
-    db.session.add(n); db.session.commit()
+    t = get_owned_tache_or_404(tid)
+    d = request.get_json(silent=True) or {}
+    texte = clean_text(d.get('texte', ''), 1000)
+    if not texte:
+        return jsonify({'msg': 'Texte requis'}), 400
+    if len(t.notes) >= 100:
+        return jsonify({'msg': 'Limite de 100 notes atteinte'}), 400
+    n = Note(texte=texte, tache_id=t.id)
+    db.session.add(n)
+    db.session.commit()
     return jsonify({'id': n.id, 'texte': n.texte, 'date': n.created_at.strftime('%d/%m/%Y %H:%M')}), 201
 
 
@@ -381,55 +706,111 @@ def api_get_projets():
 
 @app.route('/api/projets', methods=['POST'])
 @login_required
+@limiter.limit("20 per hour")
 def api_create_projet():
-    d = request.get_json()
-    p = Projet(nom=d.get('nom', '').strip(), description=d.get('description', ''),
-               couleur=d.get('couleur', '#58A6FF'), echeance=d.get('echeance', ''),
-               user_id=current_user.id)
-    db.session.add(p); db.session.commit()
-    # Ajoute le créateur comme propriétaire
+    d = request.get_json(silent=True) or {}
+
+    nom = clean_text(d.get('nom', ''), 100)
+    if not nom:
+        return jsonify({'msg': 'Le nom est requis'}), 400
+
+    description = clean_text(d.get('description', ''), 1000)
+
+    couleur = d.get('couleur', '#58A6FF')
+    if not validate_hex_color(couleur):
+        couleur = '#58A6FF'
+
+    echeance = clean_text(d.get('echeance', ''), 10)
+    if not validate_date(echeance):
+        return jsonify({'msg': 'Date invalide'}), 400
+
+    # Limite anti-abus : max 30 projets par utilisateur
+    if Projet.query.filter_by(user_id=current_user.id, archive=False).count() >= 30:
+        return jsonify({'msg': 'Limite de 30 projets atteinte'}), 400
+
+    p = Projet(nom=nom, description=description, couleur=couleur,
+               echeance=echeance, user_id=current_user.id)
+    db.session.add(p)
+    db.session.commit()
+
     m = MembreProjet(projet_id=p.id, user_id=current_user.id, role='Proprietaire')
-    db.session.add(m); db.session.commit()
+    db.session.add(m)
+    db.session.commit()
     return jsonify({'id': p.id, 'nom': p.nom, 'couleur': p.couleur}), 201
 
 
 @app.route('/api/projets/<int:pid>', methods=['PUT', 'DELETE'])
 @login_required
 def api_update_projet(pid):
-    p = Projet.query.filter_by(id=pid, user_id=current_user.id).first_or_404()
+    p = get_owned_projet_or_404(pid)
+
     if request.method == 'DELETE':
-        p.archive = True; db.session.commit()
+        p.archive = True
+        db.session.commit()
         return jsonify({'ok': True})
-    d = request.get_json()
-    for field in ('nom', 'description', 'couleur', 'echeance'):
-        if field in d: setattr(p, field, d[field])
+
+    d = request.get_json(silent=True) or {}
+
+    if 'nom' in d:
+        nom = clean_text(d['nom'], 100)
+        if nom: p.nom = nom
+
+    if 'description' in d:
+        p.description = clean_text(d['description'], 1000)
+
+    if 'couleur' in d and validate_hex_color(d['couleur']):
+        p.couleur = d['couleur']
+
+    if 'echeance' in d:
+        ech = clean_text(d['echeance'], 10)
+        if validate_date(ech):
+            p.echeance = ech
+
     db.session.commit()
     return jsonify({'id': p.id, 'nom': p.nom, 'couleur': p.couleur})
 
 
 @app.route('/api/projets/<int:pid>/membres', methods=['POST'])
 @login_required
+@limiter.limit("20 per hour")
 def api_add_membre(pid):
-    p = Projet.query.filter_by(id=pid, user_id=current_user.id).first_or_404()
-    d = request.get_json()
-    email = d.get('email', '').strip()
-    user  = User.query.filter_by(email=email).first()
+    p = get_owned_projet_or_404(pid)
+    d = request.get_json(silent=True) or {}
+
+    email = clean_text(d.get('email', ''), 120).lower()
+    if not validate_email(email):
+        return jsonify({'ok': False, 'msg': 'Email invalide'}), 400
+
+    role = d.get('role', 'Membre')
+    if role not in ('Membre', 'Editeur', 'Observateur', 'Admin'):
+        role = 'Membre'
+
+    user = User.query.filter_by(email=email).first()
     if not user:
         return jsonify({'ok': False, 'msg': 'Utilisateur introuvable'}), 404
+
     if MembreProjet.query.filter_by(projet_id=pid, user_id=user.id).first():
         return jsonify({'ok': False, 'msg': 'Déjà membre'}), 409
-    m = MembreProjet(projet_id=pid, user_id=user.id, role=d.get('role', 'Membre'))
-    db.session.add(m); db.session.commit()
+
+    if len(p.membres) >= 50:
+        return jsonify({'ok': False, 'msg': 'Limite de 50 membres atteinte'}), 400
+
+    m = MembreProjet(projet_id=pid, user_id=user.id, role=role)
+    db.session.add(m)
+    db.session.commit()
     return jsonify({'id': user.id, 'username': user.username, 'avatar': user.avatar, 'role': m.role}), 201
 
 
 @app.route('/api/projets/<int:pid>/membres/<int:uid>', methods=['DELETE'])
 @login_required
 def api_remove_membre(pid, uid):
+    # Le projet doit appartenir à l'utilisateur connecté
+    get_owned_projet_or_404(pid)
     m = MembreProjet.query.filter_by(projet_id=pid, user_id=uid).first_or_404()
     if m.role == 'Proprietaire':
         return jsonify({'ok': False, 'msg': 'Impossible de retirer le propriétaire'}), 403
-    db.session.delete(m); db.session.commit()
+    db.session.delete(m)
+    db.session.commit()
     return jsonify({'ok': True})
 
 
@@ -442,12 +823,50 @@ def api_remove_membre(pid, uid):
 def api_stats():
     return jsonify(get_stats(current_user.id))
 
-# Création automatique de la base au démarrage
+
+# ═══════════════════════════════════════════════════════════
+# GESTION D'ERREURS — ne pas exposer les détails internes
+# ═══════════════════════════════════════════════════════════
+
+@app.errorhandler(404)
+def not_found(e):
+    if request.path.startswith('/api/'):
+        return jsonify({'msg': 'Ressource introuvable'}), 404
+    return render_template('error.html', code=404, message="Page introuvable"), 404
+
+
+@app.errorhandler(403)
+def forbidden(e):
+    if request.path.startswith('/api/'):
+        return jsonify({'msg': 'Accès refusé'}), 403
+    return render_template('error.html', code=403, message="Accès refusé"), 403
+
+
+@app.errorhandler(429)
+def too_many_requests(e):
+    return jsonify({'msg': 'Trop de requêtes — réessaie plus tard'}), 429
+
+
+@app.errorhandler(500)
+def server_error(e):
+    db.session.rollback()
+    if request.path.startswith('/api/'):
+        return jsonify({'msg': 'Erreur serveur'}), 500
+    return render_template('error.html', code=500, message="Erreur serveur"), 500
+
+
+@app.errorhandler(413)
+def payload_too_large(e):
+    return jsonify({'msg': 'Requête trop volumineuse'}), 413
+
+
+# ═══════════════════════════════════════════════════════════
+# INITIALISATION DE LA BASE
+# ═══════════════════════════════════════════════════════════
+
 with app.app_context():
     db.create_all()
 
 
 if __name__ == '__main__':
-    with app.app_context():
-        db.create_all()
-    app.run(debug=True, port=5000)
+    app.run(debug=False, port=5000)

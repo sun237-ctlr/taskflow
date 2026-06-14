@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Erreur {{ code }} — TaskFlow Pro</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Inter',system-ui,sans-serif;background:#0D1117;color:#E6EDF3;min-height:100vh;display:grid;place-items:center;text-align:center}
+.code{font-size:96px;font-weight:800;color:#58A6FF;line-height:1}
+.msg{font-size:18px;color:#7D8590;margin:16px 0 28px}
+a{display:inline-block;padding:12px 28px;background:#58A6FF;color:#0D1117;border-radius:10px;text-decoration:none;font-weight:700}
+a:hover{background:#79B8FF}
+</style>
+</head>
+<body>
+<div>
+  <div class="code">{{ code }}</div>
+  <div class="msg">{{ message }}</div>
+  <a href="/">← Retour à l'accueil</a>
+</div>
+</body>
+</html>

@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>TaskFlow Pro — Connexion</title>
+<meta name="csrf-token" content="{{ csrf_token() }}">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:'Inter',system-ui,sans-serif;background:#0D1117;color:#E6EDF3;min-height:100vh;display:grid;place-items:center}
@@ -20,15 +21,15 @@ body{font-family:'Inter',system-ui,sans-serif;background:#0D1117;color:#E6EDF3;m
 label{display:block;font-size:12px;font-weight:600;color:#7D8590;margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px}
 input{width:100%;padding:12px 16px;background:#0D1117;border:1px solid #30363D;border-radius:10px;color:#E6EDF3;font-size:14px;outline:none;transition:.2s}
 input:focus{border-color:#58A6FF;box-shadow:0 0 0 3px rgba(88,166,255,.15)}
-.btn{width:100%;padding:13px;border:none;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;transition:.2s;margin-top:8px}
+.hint{font-size:11px;color:#7D8590;margin-top:5px}
+.btn{width:100%;padding:13px;border:none;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;transition:.2s;margin-top:8px;display:flex;align-items:center;justify-content:center;gap:8px}
 .btn-primary{background:#58A6FF;color:#0D1117}
-.btn-primary:hover{background:#79B8FF;transform:translateY(-1px)}
-.btn-primary:active{transform:translateY(0)}
+.btn-primary:hover:not(:disabled){background:#79B8FF;transform:translateY(-1px)}
+.btn-primary:disabled{opacity:.6;cursor:not-allowed}
 .error{background:#2D1117;border:1px solid #F85149;color:#F85149;padding:12px 16px;border-radius:10px;font-size:13px;margin-bottom:16px}
 .success{background:#122D1D;border:1px solid #3FB950;color:#3FB950;padding:12px 16px;border-radius:10px;font-size:13px;margin-bottom:16px}
-.divider{text-align:center;color:#7D8590;font-size:13px;margin:20px 0;position:relative}
-.divider::before,.divider::after{content:'';position:absolute;top:50%;width:42%;height:1px;background:#30363D}
-.divider::before{left:0}.divider::after{right:0}
+.spinner{width:14px;height:14px;border:2px solid rgba(13,17,23,.3);border-top-color:#0D1117;border-radius:50%;animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
 </style>
 </head>
 <body>
@@ -42,42 +43,45 @@ input:focus{border-color:#58A6FF;box-shadow:0 0 0 3px rgba(88,166,255,.15)}
     {% if error %}<div class="error">{{ error }}</div>{% endif %}
     <div id="msg"></div>
     <div class="tabs">
-      <button class="tab active" onclick="setTab('login')">Connexion</button>
-      <button class="tab" onclick="setTab('register')">Inscription</button>
+      <button class="tab active" type="button" onclick="setTab('login')">Connexion</button>
+      <button class="tab" type="button" onclick="setTab('register')">Inscription</button>
     </div>
 
     <!-- LOGIN -->
-    <div id="form-login">
+    <form id="form-login" onsubmit="return false">
       <div class="form-group">
         <label>Email</label>
-        <input type="email" id="l-email" placeholder="ton@email.com" autocomplete="email">
+        <input type="email" id="l-email" placeholder="ton@email.com" autocomplete="email" maxlength="120" required>
       </div>
       <div class="form-group">
         <label>Mot de passe</label>
-        <input type="password" id="l-password" placeholder="••••••••" autocomplete="current-password">
+        <input type="password" id="l-password" placeholder="••••••••" autocomplete="current-password" maxlength="128" required>
       </div>
-      <button class="btn btn-primary" onclick="doLogin()">Se connecter</button>
-    </div>
+      <button type="submit" class="btn btn-primary" id="btn-login" onclick="doLogin()">Se connecter</button>
+    </form>
 
     <!-- REGISTER -->
-    <div id="form-register" style="display:none">
+    <form id="form-register" style="display:none" onsubmit="return false">
       <div class="form-group">
         <label>Nom d'utilisateur</label>
-        <input type="text" id="r-username" placeholder="Ex: Jean Dupont">
+        <input type="text" id="r-username" placeholder="Ex: Jean Dupont" maxlength="40" required>
       </div>
       <div class="form-group">
         <label>Email</label>
-        <input type="email" id="r-email" placeholder="ton@email.com">
+        <input type="email" id="r-email" placeholder="ton@email.com" maxlength="120" required>
       </div>
       <div class="form-group">
         <label>Mot de passe</label>
-        <input type="password" id="r-password" placeholder="Min. 6 caractères">
+        <input type="password" id="r-password" placeholder="Min. 8 caractères" maxlength="128" required>
+        <div class="hint">Au moins 8 caractères, avec une lettre et un chiffre</div>
       </div>
-      <button class="btn btn-primary" onclick="doRegister()">Créer mon compte</button>
-    </div>
+      <button type="submit" class="btn btn-primary" id="btn-register" onclick="doRegister()">Créer mon compte</button>
+    </form>
   </div>
 </div>
 <script>
+const CSRF = document.querySelector('meta[name="csrf-token"]').content;
+
 function setTab(t){
   document.querySelectorAll('.tab').forEach((b,i)=>b.classList.toggle('active',(t=='login'&&i==0)||(t=='register'&&i==1)));
   document.getElementById('form-login').style.display=t=='login'?'block':'none';
@@ -85,22 +89,52 @@ function setTab(t){
   document.getElementById('msg').innerHTML='';
 }
 function showMsg(txt,ok){
-  document.getElementById('msg').innerHTML=`<div class="${ok?'success':'error'}">${txt}</div>`;
+  document.getElementById('msg').innerHTML=`<div class="${ok?'success':'error'}">${escHtml(txt)}</div>`;
 }
+function escHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+
+function setLoading(btnId, loading, label){
+  const b = document.getElementById(btnId);
+  b.disabled = loading;
+  b.innerHTML = loading ? '<span class="spinner"></span> Chargement…' : label;
+}
+
 async function doLogin(){
-  const r=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({email:document.getElementById('l-email').value,password:document.getElementById('l-password').value})});
-  const d=await r.json();
-  if(d.ok) location.href='/dashboard'; else showMsg(d.msg,false);
+  const email = document.getElementById('l-email').value.trim();
+  const password = document.getElementById('l-password').value;
+  if(!email || !password){ showMsg('Tous les champs sont requis', false); return; }
+  setLoading('btn-login', true);
+  try {
+    const r = await fetch('/login', {
+      method:'POST',
+      headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},
+      body: JSON.stringify({email, password})
+    });
+    const d = await r.json();
+    if(d.ok) location.href='/dashboard';
+    else showMsg(d.msg || 'Erreur de connexion', false);
+  } catch(e){ showMsg('Erreur réseau, réessaie.', false); }
+  setLoading('btn-login', false, 'Se connecter');
 }
+
 async function doRegister(){
-  const r=await fetch('/register',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({username:document.getElementById('r-username').value,
-      email:document.getElementById('r-email').value,password:document.getElementById('r-password').value})});
-  const d=await r.json();
-  if(d.ok) location.href='/dashboard'; else showMsg(d.msg,false);
+  const username = document.getElementById('r-username').value.trim();
+  const email = document.getElementById('r-email').value.trim();
+  const password = document.getElementById('r-password').value;
+  if(!username || !email || !password){ showMsg('Tous les champs sont requis', false); return; }
+  setLoading('btn-register', true);
+  try {
+    const r = await fetch('/register', {
+      method:'POST',
+      headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},
+      body: JSON.stringify({username, email, password})
+    });
+    const d = await r.json();
+    if(d.ok) location.href='/dashboard';
+    else showMsg(d.msg || "Erreur lors de l'inscription", false);
+  } catch(e){ showMsg('Erreur réseau, réessaie.', false); }
+  setLoading('btn-register', false, 'Créer mon compte');
 }
-document.addEventListener('keydown',e=>{if(e.key==='Enter'){const v=document.getElementById('form-login').style.display;v!=='none'?doLogin():doRegister();}});
 </script>
 </body>
 </html>
