@@ -449,3 +449,22 @@ if __name__ == '__main__':
     app.run(debug=True, port=5000)
 
 # migration route added
+
+@app.route('/migrate-db-secret-2024')
+def migrate_db():
+    try:
+        from sqlalchemy import text, inspect
+        results = []
+        with db.engine.connect() as conn:
+            inspector = inspect(db.engine)
+            cols = [c['name'] for c in inspector.get_columns('tache')]
+            for col, typ in [('en_pause','BOOLEAN DEFAULT FALSE'),('raison_pause',"VARCHAR(300) DEFAULT ''"),('notif_echeance_envoyee','BOOLEAN DEFAULT FALSE')]:
+                if col not in cols:
+                    conn.execute(text(f"ALTER TABLE tache ADD COLUMN {col} {typ}"))
+                    conn.commit()
+                    results.append("OK: "+col)
+                else:
+                    results.append("Existe: "+col)
+        return "<h2>Migration OK!</h2><ul>"+"".join(f"<li>{r}</li>" for r in results)+"</ul><p><a href='/dashboard'>Dashboard</a></p>"
+    except Exception as e:
+        return f"<h2>Erreur</h2><pre>{str(e)}</pre>",500
