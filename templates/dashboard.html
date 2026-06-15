@@ -200,7 +200,8 @@ input,select,textarea{font-family:inherit;outline:none}
     <div class="sb-stat"><div class="val" id="st-total" style="color:var(--accent)">{{ stats.total }}</div><div class="lbl">Total</div></div>
     <div class="sb-stat"><div class="val" id="st-cours" style="color:var(--orange)">{{ stats.en_cours }}</div><div class="lbl">En cours</div></div>
     <div class="sb-stat"><div class="val" id="st-done" style="color:var(--green)">{{ stats.terminees }}</div><div class="lbl">Faites</div></div>
-    <div class="sb-stat"><div class="val" id="st-late" style="color:var(--red)">{{ stats.en_retard }}</div><div class="lbl">Retard</div></div>
+    <div class="sb-stat"><div class="val" id="st-pause" style="color:var(--orange)">{{ stats.en_pause }}</div><div class="lbl">En pause</div></div>
+  <div class="sb-stat"><div class="val" id="st-late" style="color:var(--red)">{{ stats.en_retard }}</div><div class="lbl">Retard</div></div>
   </div>
   <div class="sb-prog">
     <div style="display:flex;justify-content:space-between">
@@ -217,6 +218,7 @@ input,select,textarea{font-family:inherit;outline:none}
     <button class="sb-btn" onclick="setVue('haute','Haute priorité','▲',this)"><span class="ico">▲</span> Haute priorité</button>
     <button class="sb-btn" onclick="setVue('auj','Aujourd\'hui','⊙',this)"><span class="ico">⊙</span> Aujourd'hui</button>
     <button class="sb-btn" onclick="setVue('retard','En retard','◷',this)"><span class="ico">◷</span> En retard</button>
+        <button class="sb-btn" onclick="setVue('pause','En pause','⏸',this)"><span class="ico">⏸</span> En pause</button>
     <button class="sb-btn" onclick="setVue('terminees','Terminées','✓',this)"><span class="ico">✓</span> Terminées</button>
   </nav>
 
@@ -350,11 +352,19 @@ input,select,textarea{font-family:inherit;outline:none}
           <button onclick="addNote()" style="background:var(--violet);color:#fff">Ajouter</button>
         </div>
       </div>
+
+      <!-- Pause -->
+      <div class="form-group" id="pause-section">
+        <label>Raison de la pause (optionnel)</label>
+        <input type="text" id="t-raison-pause" placeholder="Ex: En attente de validation, bloqué par..." maxlength="300">
+      </div>
     </div>
     <div class="modal-footer">
       <button class="btn btn-danger" id="btn-toggle-tache" onclick="toggleTache()">✓ Terminer</button>
+      <button class="btn" id="btn-pause-tache" onclick="togglePauseTache()" style="background:var(--orange);color:#fff">⏸ Pause</button>
       <button class="btn btn-ghost" onclick="closeModal('tache')">Annuler</button>
       <button class="btn btn-success" id="btn-save-tache" onclick="saveTache()">✓ Sauvegarder</button>
+      <button class="btn" onclick="notifierEmail()" style="background:var(--violet);color:#fff" title="Envoyer email de rappel">✉</button>
     </div>
   </div>
 </div>
@@ -618,7 +628,7 @@ async function loadTaches() {
 function renderTaches(taches) {
   const el = document.getElementById('task-list');
   if (!taches.length) {
-    const msgs = { toutes:'Ajoute ta première tâche !', terminees:'Aucune tâche terminée', haute:'Pas de tâches urgentes', retard:'Aucun retard — bravo !', auj:"Rien pour aujourd'hui" };
+    const msgs = { toutes:'Ajoute ta première tâche !', terminees:'Aucune tâche terminée', haute:'Pas de tâches urgentes', retard:'Aucun retard — bravo !', auj:"Rien pour aujourd'hui", pause:'Aucune tâche en pause' };
     el.innerHTML = `<div class="empty"><div class="ico">✦</div><h3>Aucune tâche ici</h3><p>${escHtml(msgs[state.vue]||'')}</p></div>`;
     return;
   }
@@ -635,6 +645,7 @@ function cardHTML(t) {
     t.assigne_a    ? `<span class="badge">◆ ${escHtml(t.assigne_a)}</span>` : '',
     ...t.tags.filter(Boolean).slice(0,3).map(tg=>`<span class="badge tag">◇ ${escHtml(tg.trim())}</span>`),
     t.sous_taches?.length ? `<span class="badge sub-ok">☑ ${t.sous_taches.filter(s=>s.terminee).length}/${t.sous_taches.length}</span>` : '',
+    t.en_pause     ? `<span class="badge" style="background:#2D2010;color:var(--orange)">⏸ En pause${t.raison_pause?' · '+escHtml(t.raison_pause.slice(0,20)):''}</span>` : '',
     t.notes_count  ? `<span class="badge">✐ ${t.notes_count}</span>` : '',
   ].filter(Boolean).join('');
 
@@ -714,6 +725,15 @@ async function openTache(id) {
     state.projets.forEach(p => { const o=document.createElement('option'); o.value=p.id; o.textContent=p.nom; sp.appendChild(o); });
     sp.value = t.projet_id || '';
     document.getElementById('btn-toggle-tache').textContent = t.terminee ? '↩ Rouvrir' : '✓ Terminer';
+    // Pause
+    const pauseBtn = document.getElementById('btn-pause-tache');
+    if (pauseBtn) {
+      pauseBtn.textContent = t.en_pause ? '▷ Reprendre' : '⏸ Pause';
+      pauseBtn.style.background = t.en_pause ? 'var(--green)' : 'var(--orange)';
+      pauseBtn.disabled = t.terminee;
+    }
+    const raisonInp = document.getElementById('t-raison-pause');
+    if (raisonInp) raisonInp.value = t.raison_pause || '';
     renderSousTaches(t.sous_taches);
     renderNotes(t.notes || []);
     openModal('tache');
@@ -917,6 +937,8 @@ async function loadStats() {
     document.getElementById('st-cours').textContent = s.en_cours;
     document.getElementById('st-done').textContent  = s.terminees;
     document.getElementById('st-late').textContent  = s.en_retard;
+    const pauseEl = document.getElementById('st-pause');
+    if (pauseEl) pauseEl.textContent = s.en_pause || 0;
     document.getElementById('st-taux').textContent  = s.taux + '%';
     document.getElementById('prog-fill').style.width = s.taux + '%';
   } catch(e) {}
@@ -995,6 +1017,33 @@ function exportCSV() {
   const a = document.createElement('a');
   a.href = 'data:text/csv;charset=utf-8,\uFEFF'+encodeURIComponent(csv);
   a.download = 'taskflow_export.csv'; a.click();
+}
+
+
+// ══ PAUSE / REPRISE ══════════════════════════════════════════
+async function togglePauseTache() {
+  const id = document.getElementById('t-id').value;
+  const t = state.taches_cache.find(x=>x.id==id);
+  const raison = document.getElementById('t-raison-pause')?.value.trim() || '';
+  const btn = document.getElementById('btn-pause-tache');
+  if (btn) btn.disabled = true;
+  try {
+    const res = await api('/api/taches/'+id+'/pause','POST',{raison});
+    toast(res.msg, 'info');
+    closeModal('tache');
+    await loadTaches();
+  } catch(e) { toast(e.message,'error'); }
+  if (btn) btn.disabled = false;
+}
+
+// ══ EMAIL NOTIFICATION ════════════════════════════════════════
+async function notifierEmail() {
+  const id = document.getElementById('t-id').value;
+  if (!confirm('Envoyer un email de rappel d\'échéance aux membres concernés ?')) return;
+  try {
+    const res = await api('/api/taches/'+id+'/notifier','POST');
+    toast(res.msg, 'success');
+  } catch(e) { toast(e.message,'error'); }
 }
 
 // ══ UTILS ════════════════════════════════════════════════════
